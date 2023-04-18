@@ -1,0 +1,300 @@
+from __future__ import print_function
+import torch
+import os
+import argparse
+import pickle
+import numpy as np
+import scipy
+import utils
+import model
+from collections import Counter
+from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+import time
+
+def l1loss(mat):
+    return torch.norm(mat, p=1)
+
+if __name__=="__main__":
+    
+     
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--faithful', type=str, default="less") 
+    parser.add_argument('--understandable', type=str, default="less") 
+    parser.add_argument('--num_attr', type=int, default=16, metavar='N',
+                        help='number of attributes to use (default: 16)')
+    parser.add_argument('--lmbda', type=float, default=0.01, metavar='reg',
+                        help='learnability regularizer')
+    parser.add_argument('--epochs', type=int, default=100, metavar='epochs',
+                        help='Epochs')
+    parser.add_argument('--outsize', type=str, default='group', metavar='out',
+                        help='which predictions to use ')
+    parser.add_argument('--save', type=str, default='record/exp1', metavar='S',
+                        help='save directory')
+    parser.add_argument('--test', action='store_true', default=False,
+                        help='test on validation data')
+
+    args = parser.parse_args()
+
+    
+    if args.outsize=='all': 
+        features, attr, predictions, logits, names = utils.get_ade20k_features(non_zero=True)
+    elif args.outsize=='group':
+        features, attr, predictions, logits, names = utils.get_ade20k_features_scenegroup()
+    elif args.outsize=='binary':
+        features, attr, predictions, logits, names = utils.get_ade20k_features_binary()
+
+    train_features = torch.Tensor(features['train'])
+    val_features = torch.Tensor(features['val'])
+    test_features = torch.Tensor(features['test'])
+
+    train_attr = torch.Tensor(attr['train'])
+    val_attr = torch.Tensor(attr['val'])
+    test_attr = torch.Tensor(attr['test'])
+    print(train_attr.shape)
+
+    train_pred365 = torch.Tensor(predictions['train'])
+    val_pred365 = torch.Tensor(predictions['val'])
+    test_pred365 = torch.Tensor(predictions['test'])
+    
+    train_logits = logits['train']
+    val_logits = logits['val']
+    test_logits = logits['test']
+    
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+
+    m_attr = model.just_rotation(in_dimension=train_features.shape[1], total_attr=train_attr.shape[1])
+    m_attr.load_state_dict(torch.load('record/new_attr_align/feature_final.pth', map_location=device)['model'])
+    m_attr.eval()
+    
+
+    train_rot_features = m_attr(train_features).detach()
+    val_rot_features = m_attr(val_features).detach()
+    test_rot_features = m_attr(test_features).detach()
+
+    attr_losses_train = []
+    
+    if args.outsize=='all':
+        relevant_attr = sorted([52, 45, 121, 203, 319, 215, 328, 175, 283, 182, 281, 51, 363, 307, 112, 256, 102, 352, 125, 26])
+        
+        
+        #for a in relevant_attr:
+        #    print(scenes[a])
+
+
+        train_idx = []
+        for a in relevant_attr:
+            train_idx += list(np.argwhere(train_pred365 == a).squeeze())
+        
+        print(len(train_idx))
+
+        train_features = train_features[train_idx]
+        train_attr = train_attr[train_idx]
+        train_pred365 = train_pred365[train_idx]
+        train_pred365 = torch.Tensor([relevant_attr.index(a) for a in train_pred365])
+        
+        train_logits = train_logits[train_idx]
+        train_logits = train_logits[:, relevant_attr]
+        train_rot_features = train_rot_features[train_idx]
+
+        val_idx = []
+        for a in relevant_attr:
+            val_idx += list(np.argwhere(val_pred365 == a).squeeze())
+        
+        print(len(val_idx))
+
+        val_features = val_features[val_idx]
+        val_attr = val_attr[val_idx]
+        val_pred365 = val_pred365[val_idx]
+        val_pred365 = torch.Tensor([relevant_attr.index(a) for a in val_pred365])
+        val_logits = val_logits[val_idx]
+        val_logits = val_logits[:, relevant_attr]
+        val_rot_features = val_rot_features[val_idx]
+
+        test_idx = []
+        for a in relevant_attr:
+            test_idx += list(np.argwhere(test_pred365 == a).squeeze())
+        
+        print(len(test_idx))
+
+        test_features = test_features[test_idx]
+        test_attr = test_attr[test_idx]
+        test_pred365 = test_pred365[test_idx]
+        test_pred365 = torch.Tensor([relevant_attr.index(a) for a in test_pred365])
+        test_logits = test_logits[test_idx]
+        test_logits = test_logits[:, relevant_attr]
+        test_rot_features = test_rot_features[test_idx]
+        
+        print(len(np.unique(train_pred365)), train_logits.shape, train_rot_features.shape, val_logits.shape)
+    
+    if args.faithful == 'somewhat':
+        train_target = torch.Tensor(train_logits)
+        val_target = torch.Tensor(val_logits)
+        test_target = torch.Tensor(test_logits)
+        outsize = test_target.shape[1]
+    elif args.faithful == 'less':
+        train_target = torch.Tensor(train_pred365).to(torch.long)
+        val_target = torch.Tensor(val_pred365).to(torch.long)
+        test_target = torch.Tensor(test_pred365).to(torch.long)
+        
+        if args.outsize !='binary':
+            outsize =int(max(train_target)+1)
+        else:
+            outsize = 1
+
+    for a in range(train_rot_features.shape[1]):
+        loss = torch.nn.BCEWithLogitsLoss()(train_rot_features[:, a], train_attr[:, a]).detach().data
+        attr_losses_train.append(loss)
+    
+    attr_losses_train = torch.Tensor(attr_losses_train).to(device)
+    if args.understandable == 'less':
+        valid_attr = pickle.load(open('to_keep_less_under.pkl', 'rb'))
+        train_feat = train_rot_features[:, valid_attr]
+        val_feat = val_rot_features[:, valid_attr]
+        test_feat = test_rot_features[:, valid_attr]
+    elif args.understandable == 'somewhat':
+        valid_attr = pickle.load(open('to_keep_somewhat_under.pkl', 'rb'))
+        train_feat = torch.sigmoid(train_rot_features[:, valid_attr]).detach()
+        #print(train_feat)
+        val_feat = torch.sigmoid(val_rot_features[:, valid_attr]).detach()
+        test_feat = torch.sigmoid(test_rot_features[:, valid_attr]).detach()
+    elif args.understandable == 'more':
+        valid_attr = pickle.load(open('to_keep_more_under.pkl', 'rb'))
+        train_feat = train_attr[:, valid_attr]
+        val_feat = val_attr[:, valid_attr]
+        test_feat = test_attr[:, valid_attr]
+    elif args.understandable == 'more_v2':
+        train_feat = torch.Tensor(np.where(train_rot_features.numpy()>0, 1, 0))
+        val_feat = torch.Tensor(np.where(val_rot_features.numpy()>0, 1, 0))
+        test_feat = torch.Tensor(np.where(test_rot_features.numpy()>0, 1, 0))
+    
+    print(train_target.shape, outsize, train_feat.shape)
+    model = torch.nn.Linear(train_feat.shape[1], outsize)
+    model = model.to(device)
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr = 0.001)
+    print(train_attr.shape)
+    
+        
+    from sklearn.linear_model import LogisticRegression, LinearRegression
+
+    if args.faithful=='somewhat':
+        criterion1 = torch.nn.MSELoss()
+    elif args.faithful=='less':
+        if args.outsize=='binary':
+            train_target = train_target.to(dtype=torch.float32)
+            test_target = test_target.to(dtype=torch.float32)
+            val_target = val_target.to(dtype=torch.float32)
+            criterion1 = torch.nn.BCEWithLogitsLoss()
+        else:
+            criterion1 = torch.nn.CrossEntropyLoss()
+
+    criterion2 = torch.nn.L1Loss()
+    mses = []
+    current = []
+    
+    try:
+        os.makedirs(args.save)
+    except:
+        pass
+     
+    try:
+        os.makedirs(args.save)
+    except:
+        pass
+    
+    temp = 0.1
+    batch = 2048
+    N = len(train_features)//batch + 1
+    learn_attr = True
+    temp = 0.005
+    train_sum = train_feat.sum(dim=0)
+    diffs = train_feat.max(dim=0)[0] - train_feat.min(dim=0)[0]
+    diffs = diffs.to(device, dtype=torch.float32)
+    diffs = torch.where(diffs ==0, torch.ones_like(diffs), diffs)
+
+    if not args.test:
+        for e in range(args.epochs):
+            
+            model.train()
+            if e>=500 and e%100==0 and temp < 40:
+               temp *= 2
+            
+            overall_loss = 0
+            for t in range(N):
+                feat_batch = train_feat[t*batch:(t+1)*batch].to(device)
+                target_batch = train_target[t*batch:(t+1)*batch].to(device)
+                
+                sc = model(feat_batch)
+                optimizer.zero_grad()
+                loss = criterion1(sc, target_batch) 
+                weights_sum = torch.sum(model.weight*model.weight, dim=0)
+                weights_sum/=diffs
+                weight_sort = torch.sort(weights_sum)
+
+                loss_attr_selection = l1loss(weight_sort[0][:-args.num_attr].to(device))  
+                loss+=temp*(loss_attr_selection)
+                loss+=args.lmbda*attr_losses_train[weight_sort[1][-args.num_attr:]].sum()
+                
+                loss.backward()
+                optimizer.step()
+                
+                overall_loss+=loss
+                
+            
+            model.eval()
+            
+            with torch.no_grad():
+                
+                val_sc = model(val_feat.to(device))
+
+                loss = criterion1(val_sc, val_target.to(device))
+                
+                weights_sum = torch.sum(model.weight*model.weight, dim=0)
+                weight_sort = torch.sort(weights_sum)
+                loss_attr_selection = l1loss(weight_sort[0][:-args.num_attr].to(device)) #criterion2(weights_sum, torch.zeros_like(weights_sum).to(device)) 
+                
+
+                curr_loss = loss+temp*(loss_attr_selection)
+                loss_attr_acc = attr_losses_train[weight_sort[1][-args.num_attr:]].sum()
+                curr_loss += args.lmbda*loss_attr_acc
+           
+            #if e==499:
+            #    temp = 0.01
+            torch.save({'model':model.state_dict(), 'optimizer':optimizer.state_dict(), 'epoch': e, 'loss':min_loss}, 
+                        '{}/feature_current.pth'.format(args.save)
+                        )
+            if e%20==0:
+                print(e, temp, loss, loss_attr_selection, loss_attr_acc, flush=True)
+            
+     
+    
+    import pandas as pd
+    attr_names = pd.read_csv('../NetDissect-Lite/dataset/broden1_224/label.csv', index_col=0)['name'].to_dict()
+
+    model.load_state_dict(torch.load('{}/feature_current.pth'.format(args.save))['model'])
+    
+    feat_reshape = torch.tile(val_feat.view(val_feat.shape[0], val_feat.shape[1], 1), (1, 1, 16)).to(device)
+    weight_reshape = torch.tile(model.weight.T.reshape(1, *model.weight.T.shape), (val_feat.shape[0], 1, 1)).to(device)
+    print(weight_reshape.shape) 
+
+    weights_sum = torch.sum(model.weight*model.weight, dim=0)
+    weights_sum/=diffs
+    weight_sort = torch.sort(weights_sum)
+
+    print(weight_sort)
+
+    imp_attr = weight_sort[1][-args.num_attr:]
+    
+    pickle.dump(imp_attr, open('{}/imp_attr.pkl'.format(args.save), 'wb+'))
+    
+    over20 = pickle.load(open('over20.pkl', 'rb'))
+
+    for i, a in enumerate(imp_attr):
+        print(attr_names[over20[valid_attr[a]]]) 
+
